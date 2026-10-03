@@ -28,6 +28,7 @@
 #include "GPU/Software/BinManager.h"
 #include "GPU/Software/Rasterizer.h"
 #include "GPU/Software/RasterizerRectangle.h"
+#include "GPU/Software/SoftGpu.h"
 
 // Sometimes useful for debugging.
 static constexpr bool FORCE_SINGLE_THREAD = false;
@@ -272,6 +273,9 @@ bool BinManager::IsExactSelfRender(const Rasterizer::RasterizerState &state, con
 		return false;
 	if (state.textureProj || state.maxTexLevel > 0)
 		return false;
+	// A matching color copy does not establish independence from translated depth writes.
+	if (depthbuf.translated && state.pixelID.depthWrite)
+		return false;
 
 	// Only possible if the texture is 1:1.
 	if ((state.texaddr[0] & 0x0F1FFFFF) != (gstate.getFrameBufAddress() & 0x0F1FFFFF))
@@ -336,8 +340,31 @@ void BinManager::MarkPendingWrites(const Rasterizer::RasterizerState &state) {
 	constexpr uint32_t mirrorMask = 0x041FFFFF;
 	const uint32_t bpp = state.pixelID.FBFormat() == GE_FORMAT_8888 ? 4 : 2;
 	pendingWrites_[0].Expand(gstate.getFrameBufAddress() & mirrorMask, bpp, gstate.FrameBufStride(), scissorTL, scissorBR);
-	if (state.pixelID.depthWrite)
-		pendingWrites_[1].Expand(gstate.getDepthBufAddress() & mirrorMask, 2, gstate.DepthBufStride(), scissorTL, scissorBR);
+	if (state.pixelID.depthWrite) {
+		if (!depthbuf.translated) {
+			pendingWrites_[1].Expand(gstate.getDepthBufAddress() & mirrorMask, 2, gstate.DepthBufStride(), scissorTL, scissorBR);
+		} else if (scissorTL.x <= scissorBR.x && scissorTL.y <= scissorBR.y) {
+			// The permutation stays inside each 64 KiB page; include whole touched pages conservatively.
+			uint32_t begin = (depthbuf.baseOffset + (scissorTL.y * gstate.DepthBufStride() + scissorTL.x) * 2) & ~0xFFFF;
+			uint32_t end = (depthbuf.baseOffset + (scissorBR.y * gstate.DepthBufStride() + scissorBR.x + 1) * 2 + 0xFFFF) & ~0xFFFF;
+			if (end > 0x00200000) {
+				// Out-of-range logical writes can wrap through the existing VRAM mirrors.
+				begin = 0;
+				end = 0x00200000;
+			}
+			begin |= 0x04000000;
+			end += 0x04000000;
+			auto &range = pendingWrites_[1];
+			if (range.base != 0) {
+				begin = std::min(begin, range.base);
+				end = std::max(end, range.base + range.height * range.strideBytes);
+			}
+			range.base = begin;
+			range.strideBytes = end - begin;
+			range.widthBytes = range.strideBytes;
+			range.height = 1;
+		}
+	}
 }
 
 inline void BinDirtyRange::Expand(uint32_t newBase, uint32_t bpp, uint32_t stride, const DrawingCoords &tl, const DrawingCoords &br) {
@@ -629,6 +656,14 @@ bool BinManager::HasPendingWrite(uint32_t start, uint32_t stride, uint32_t w, ui
 	start &= 0x041FFFFF;
 
 	uint32_t size = stride * (h - 1) + w;
+	if (depthbuf.translated && pendingWrites_[1].base != 0) {
+		// Query envelopes are conservative too, including reads or transfers crossing a mirror boundary.
+		const auto &range = pendingWrites_[1];
+		if (size >= 0x00200000 || start + size > 0x04200000)
+			return true;
+		if (start < range.base + range.widthBytes && start + size > range.base)
+			return true;
+	}
 	for (const auto &range : pendingWrites_) {
 		if (range.base == 0 || range.strideBytes == 0)
 			continue;
